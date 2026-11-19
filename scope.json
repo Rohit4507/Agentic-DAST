@@ -1,0 +1,41 @@
+{
+  "name": "mock-travel-api",
+  "description": "Local deliberately-vulnerable target. Every path below was written by a human, and nothing in the process can add to it.",
+  "base_url": "http://127.0.0.1:8080",
+  "allow_hosts": ["127.0.0.1"],
+  "allow_methods": ["GET", "POST"],
+  "allow_paths": [
+    "/healthz",
+    "/api/bookings",
+    "/api/booking",
+    "/api/ledger",
+    "/api/hold",
+    "/api/pay",
+    "/api/confirm",
+    "/api/cancel",
+    "/api/refund",
+    "/api/rebook",
+    "/api/v1",
+    "/api/old",
+    "/api/internal",
+    "/api/test/debug"
+  ],
+  "deny_paths": ["/api/refund/bulk", "/api/admin"],
+  "max_rps_per_host": 8,
+  "max_burst": 8,
+  "max_total_requests": 120,
+  "max_wait_seconds": 10,
+  "accounts": {
+    "agency_a": "literal:tok-agency-a",
+    "agency_b": "literal:tok-agency-b"
+  },
+  "role_agencies": {
+    "agency_a": "AGENCY-A",
+    "agency_b": "AGENCY-B"
+  },
+  "kill_switch_file": "KILL",
+  "traffic_window_days": 30,
+  "js_bundles": ["target/static/app.js"],
+  "assets_file": "assets.json",
+  "allow_insecure_tls": false
+}

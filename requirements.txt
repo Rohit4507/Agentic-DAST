@@ -1,0 +1,13 @@
+# The harness and the mock target are standard-library only (Python 3.10+).
+# `python run.py all` and `python -m unittest discover` need nothing installed.
+#
+# Optional extras, only needed against a real target:
+#   playwright   browser-based journey recording (dast/record/journey.py)
+#                pip install playwright && playwright install chromium
+#   httpx        HTTP/2 and fine-grained connection control, if you swap out dast/http.py
+#
+# Deliberately not required:
+#   an LLM SDK    the shipped pipeline makes zero model calls; the planner seam is
+#                 dast/pipeline.py:plan_tests(), which takes structured output and
+#                 never sends a request itself.
+playwright>=1.40.0 ; extra == "record"

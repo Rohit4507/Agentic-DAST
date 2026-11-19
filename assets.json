@@ -1,0 +1,19 @@
+{
+  "_comment": "Asset ownership (provided input in the real engagement). Longest matching path prefix wins.",
+  "owners": {
+    "/api/booking": "Bookings API team",
+    "/api/bookings": "Bookings API team",
+    "/api/ledger": "Payments & Ledger team",
+    "/api/pay": "Payments & Ledger team",
+    "/api/refund": "Payments & Ledger team",
+    "/api/rebook": "Fares & Pricing team",
+    "/api/hold": "Bookings API team",
+    "/api/cancel": "Bookings API team",
+    "/api/confirm": "Bookings API team",
+    "/api/v1": "Bookings API team (legacy)",
+    "/api/old": "Platform Retirement backlog",
+    "/api/internal": "Supplier Integrations team",
+    "/api/test": "Platform Engineering",
+    "/healthz": "Platform Engineering"
+  }
+}
