@@ -26,18 +26,19 @@ from .auth import TokenStore
 from .errors import STOPPING, DastError, ScopeViolation, TransportError
 from .fields import first
 from .gate import ApprovalGate
-from .http import Client
+from .http import Client, TransportOptions
 from .inventory.classify import build_inventory, probe_candidates, render_table, to_dicts
 from .inventory.harvest import harvest_files, union_routes
 from .inventory.openapi import build_spec, write_spec
 from .inventory.traffic import load_asset_map, read_gateway_log
-from .model import ACTIVE, SHADOW, ZOMBIE, EndpointRecord, Finding, TrafficHit, iso, utcnow
+from .model import ACTIVE, SHADOW, ZOMBIE, EndpointRecord, Finding, TrafficHit, iso, template_of, utcnow
 from .profile import StepSpec, TargetProfile
 from .record.har import merge_hits, read_har
 from .report.dedupe import DedupeReport, dedupe
 from .report.sarif import write_sarif
 from .report.ticket import render_index, write_findings
 from .scope import ScopeConfig, ScopeGuard
+from .token_refresh import build_refresher
 from .verify.engine import Capsule, replay_capsule
 from .verify.ledger_source import build_ledger_source
 
@@ -135,6 +136,7 @@ def open_engagement(
     approve_writes: bool = False,
     component: str = "pipeline",
     timeout: float = 15.0,
+    transport: TransportOptions | None = None,
 ) -> Engagement:
     scope_file = Path(scope_path)
     cfg = ScopeConfig.load(scope_file)
@@ -144,7 +146,12 @@ def open_engagement(
     audit = AuditLog(out / "audit.jsonl")
     guard = ScopeGuard(cfg)
     tokens = TokenStore(dict(cfg.accounts))
-    client = Client(guard, audit, tokens, component=component, timeout=timeout)
+    client = Client(guard, audit, tokens, component=component, timeout=timeout, transport=transport)
+    refresher = build_refresher(client, cfg.auth)
+    if refresher is not None:
+        # Two-step on purpose: the refresher needs the client (its request must pass the
+        # same guard), and the client needs the refresher only when a 401 arrives.
+        client.refresher = refresher
     eng = Engagement(cfg=cfg, guard=guard, audit=audit, tokens=tokens, client=client, out=out, profile=profile)
     audit.note(
         stage="engagement-open",
@@ -158,6 +165,13 @@ def open_engagement(
         profile=profile.name,
         profile_source=profile.source,
         profile_summary=profile.summarize(),
+        transport={
+            "retries": client.options.retries,
+            "retry_max_wait": client.options.retry_max_wait,
+            "max_wall_clock": client.options.max_wall_clock,
+            "timeout": client.options.timeout,
+            "token_refresh": bool(refresher),
+        },
     )
     return eng
 
@@ -566,6 +580,42 @@ class ExecutionResult:
     executed: int
 
 
+def prioritise_plan(
+    plan: list[PlannedTest],
+    bola_targets: list[BolaTarget],
+    priority: Iterable[str],
+    *,
+    drop_others: bool = False,
+) -> tuple[list[PlannedTest], list[BolaTarget], int]:
+    """Put the routes a deploy touched at the front of the plan.
+
+    Ordering is stable, so a plan without a deploy event comes out unchanged.  With
+    ``drop_others`` the untouched routes are not executed at all -- that is the point of a
+    deploy trigger: a three-route deploy should cost three routes, not a full scan.  The
+    count of deferred tests is returned so the summary can say what was *not* covered.
+    """
+    def key(path: str) -> str:
+        # A CI event may hand over a concrete path ("/v2/orders/8842/refund"); the plan
+        # holds templates.  Template first, then the tolerant comparison.
+        return _norm_route(template_of(path)[0])
+
+    wanted = {key(r) for r in priority}
+    if not wanted:
+        return list(plan), list(bola_targets), 0
+
+    def hit(endpoint: str) -> bool:
+        return key(endpoint) in wanted
+
+    first = [p for p in plan if hit(p.endpoint)]
+    rest = [p for p in plan if not hit(p.endpoint)]
+    bola_first = [t for t in bola_targets if hit(t.template)]
+    bola_rest = [t for t in bola_targets if not hit(t.template)]
+    deferred = len(rest) + len(bola_rest)
+    if drop_others:
+        return first, bola_first, deferred
+    return first + rest, bola_first + bola_rest, deferred
+
+
 def execute_plan(
     eng: Engagement,
     plan: list[PlannedTest],
@@ -898,6 +948,8 @@ def run_all(
     probe: bool = True,
     max_probes: int = 15,
     on_inventory: Any = None,
+    priority: Iterable[str] = (),
+    only_priority: bool = False,
 ) -> RunResult:
     t0 = time.monotonic()
     inv = collect_inventory(
@@ -911,6 +963,28 @@ def run_all(
     planned, bola_targets = plan_tests(
         eng, inv, agency_by_role=agency_by_role, include_writes=include_writes
     )
+    if priority:
+        planned, bola_targets, deferred = prioritise_plan(
+            planned, bola_targets, priority, drop_others=only_priority
+        )
+        if only_priority:
+            print(
+                f"deploy priority: {len(set(priority))} route(s) from the deploy, "
+                f"{len(planned) + len(bola_targets)} test target(s) kept, {deferred} deferred"
+            )
+        else:
+            print(
+                f"deploy priority: {len(set(priority))} route(s) from the deploy, "
+                f"tested first; {deferred} other test target(s) follow"
+            )
+        eng.audit.note(
+            stage="plan",
+            kind="deploy-priority",
+            routes=sorted(set(priority)),
+            kept=len(planned) + len(bola_targets),
+            deferred=deferred,
+            only_priority=only_priority,
+        )
 
     gate = ApprovalGate(auto=approve_writes, audit=eng.audit)
     execution = execute_plan(eng, planned, bola_targets, inv, gate=gate)

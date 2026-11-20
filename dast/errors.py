@@ -45,8 +45,17 @@ class KillSwitchEngaged(StoppingCondition):
     """The operator (or a monitor) dropped the kill file."""
 
 
+class WallClockExhausted(BudgetExhausted):
+    """The run's wall-clock cap was reached.
+
+    A specialisation of :class:`BudgetExhausted` on purpose: every handler that already
+    treats a spent request budget as "the engagement is over" must treat a spent *time*
+    budget the same way, or the run degrades into a page of quiet skips.
+    """
+
+
 #: tuple form, for ``except`` clauses that must re-raise before handling ScopeViolation
-STOPPING = (KillSwitchEngaged, BudgetExhausted)
+STOPPING = (KillSwitchEngaged, BudgetExhausted)  # WallClockExhausted included via inheritance
 
 
 class TransportError(DastError):

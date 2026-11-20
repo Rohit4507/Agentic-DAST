@@ -60,6 +60,7 @@ _KNOWN_KEYS = {
     "allow_insecure_tls",
     "user_agent",
     "profile",
+    "auth",
 }
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
@@ -93,6 +94,8 @@ class ScopeConfig:
     #: Path to the target profile (vocabulary: paths, bodies, field names).
     #: Empty means "the bundled mock's vocabulary", i.e. version-1 behaviour.
     profile: str = ""
+    #: Optional token-refresh block (see dast/token_refresh.py).  Empty means "no refresh".
+    auth: Mapping[str, Any] = field(default_factory=dict)
     user_agent: str = "dast-agent/0.1 (scope-checked; security testing)"
 
     # -- construction ---------------------------------------------------------------
@@ -168,6 +171,7 @@ class ScopeConfig:
             assets_file=str(raw.get("assets_file", "")),
             allow_insecure_tls=bool(raw.get("allow_insecure_tls", False)),
             profile=str(raw.get("profile", "") or ""),
+            auth=dict(raw.get("auth", {}) or {}),
             user_agent=str(raw.get("user_agent", "dast-agent/0.1 (scope-checked; security testing)")),
         )
 

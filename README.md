@@ -25,7 +25,7 @@ Standard library only. No API keys, no `pip install`, Python 3.10+.
 
 | Stage | Implementation | Output |
 |---|---|---|
-| **Detect change** | bundle hashing + route delta (`run.py diff`), gateway-log deltas | added/removed routes since the last run |
+| **Detect change** | CI deploy event (`diff --deploy-event`: SHA + service + changed paths, idempotent per SHA) or bundle hash + route delta, plus gateway-log deltas | the routes to retest, and how many were deferred |
 | **Learn the app** | HAR journeys per role + static JS harvest + 30-day gateway log + capped, scope-checked liveness probes | `work/inventory.json` |
 | **Zombie / shadow** | three-way diff: traffic × bundle × declared spec | `active / zombie / shadow` per endpoint, with last traffic, auth reachability, data exposed, owner, recommendation |
 | **Plan** | rule engine over the inventory, emitting a ranked test list with a rationale per test | `work/audit.jsonl` `plan` stage |
@@ -189,7 +189,8 @@ dast/
   report/                   ticket markdown, SARIF, severity, dedupe
 target/                     deliberately vulnerable mock travel API (/api/..., flat JSON)
 target2/                    second vulnerable API (/v2/..., nested JSON, different field names)
-tests/                     179 stdlib unittest tests, including the precision and genericity cases
+tests/                     228 stdlib unittest tests, including the precision, genericity,
+                           transport (retry/refresh/wall-clock) and deploy-event cases
 captures/                   recorded journeys, the "provided HAR" input
 ```
 
@@ -202,8 +203,45 @@ python run.py catalogue                # the test library (the planner's enum)
 python run.py guard-demo               # 8 out-of-scope attempts, all refused; exit code 1 if any passes
 python run.py retest                   # replay capsules / re-execute logic, auto-close fixed
 python run.py diff --bundle target/static/app.js   # route delta since the last run
-python -m unittest discover -s tests -t .          # 179 tests
+python -m unittest discover -s tests -t .          # 228 tests
 ```
+
+### Change-driven runs (what CI actually knows)
+
+```bash
+# 1. CI writes what shipped.  sha is the idempotency key: a retried webhook is a no-op.
+cat > event.json <<'JSON'
+{"sha": "9f3c1ab7", "service": "orders-api", "at": "2026-11-19T09:14:00Z",
+ "changed_paths": ["/api/refund", "/api/rebook", "/api/pay"],
+ "bundle_urls": ["http://127.0.0.1:8080/static/app.js"]}
+JSON
+
+python run.py diff --deploy-event event.json          # map changed paths onto the inventory
+python run.py scan --changed-only --approve-writes    # test only those routes; say what was deferred
+```
+
+`--changed-only` is the difference between a full scan and a three-route deploy: on the
+bundled mock the full loop sends 39 requests in 3.9 s, the deploy-scoped run sends 17 in
+1.1 s and still reports the two findings whose routes changed. Untouched tests are counted
+as *deferred*, never silently dropped. Without `--changed-only` the changed routes are
+simply tested first.
+
+Bundles named in the event (`bundle_urls`, or `--bundle-url`) are fetched through the
+scope-checked client, so they cost budget, appear in the audit log, and are refused if the
+host is out of scope.
+
+### Hostile transport
+
+```bash
+python run.py all --retries 2 --retry-max-wait 10 --max-wall-clock 600 --timeout 15
+```
+
+* `429` / `503` are retried honouring `Retry-After` (seconds or HTTP-date). **A retry is a
+  request**: it passes the guard, spends budget, and gets its own audit line (`attempt=N`).
+  `500` is not retried — it is a broken host, not a busy one.
+* One `401` triggers one token refresh (`auth.refresh` in `scope.json`, secrets from
+  `env:`), then one replay. A failed refresh voids the request; it never guesses.
+* `--max-wall-clock` turns a slow host into a clean stop (exit 4) instead of a hang.
 
 Without `--approve-writes`, write tests are **skipped and reported as such** — the gate
 fails closed in non-interactive runs rather than assuming consent.

@@ -63,25 +63,52 @@ customer.
 The mock's numbers are **unchanged** from version 1 — the profile layer is additive, and
 `profiles/mock.json` is asserted equal to the built-in defaults so the two cannot drift.
 
+An **incremental** run is now a different measurement, because the deploy event says what
+to retest. Same mock, event naming three changed paths (`/api/refund`, `/api/rebook`,
+`/api/pay`), `python run.py scan --changed-only`:
+
+| | full run | deploy-scoped run |
+|---|---|---|
+| Requests | 39 | 17 |
+| Audit entries | 47 | 27 |
+| Findings | 7 | 2 (double refund 8.1, fare tampering 7.9) |
+| Test targets deferred | 0 | 11 |
+| Elapsed | 3.88 s | 1.13 s |
+
+The two findings are exactly the ones whose routes the deploy touched; the other five
+belong to routes that did not change and are reported as deferred, not as absent.
+
 `tests/test_genericity.py` also runs target2 **with the mock's profile**: the
 identity-dependent tests go quiet, route-driven exposure still fires. Same target, same
 traffic, same code — only vocabulary changes. That isolates the cause and is the reason
 the layer exists.
+
+## What closed, and how it was proved
+
+| # | Item | Evidence |
+|---|---|---|
+| 2 | `429` / `503` backoff with `Retry-After` | `dast/http.py` retry loop. A stub answering `429` + `Retry-After: 1` twice then `200` produces **3 audited requests, 3 budget-charged, 1 result** (`tests/test_transport.py::TestRetryOn429`). `Retry-After` is read as seconds *or* an HTTP-date; a single wait is capped by `--retry-max-wait`. Every attempt carries its own audit line with `attempt=N`, so a retry is never invisible. `500` is **not** retried — it is a broken host, not a busy one. |
+| 4 | Token refresh hook | `dast/token_refresh.py` + `auth.refresh` in `scope.json`. One 401 triggers one refresh then one replay; the refresh request goes through the same guard; a failed refresh voids the request rather than raising. Secrets come from `env:` and are asserted absent from the audit log (`TestTokenRefresh`). |
+| 5 | `--deploy-event` | `dast/deploy.py` + `run.py diff --deploy-event` + `scan --changed-only`. `sha` is the idempotency key: replaying a webhook does not re-run. Unknown keys, a missing `sha`, non-absolute bundle URLs and unparseable JSON are all exit 2 naming the field. `changed_paths` are templated and matched against `work/inventory.json`; anything unmatched is listed as *not yet inventoried* rather than silently dropped. |
+| 7 | Bundle fetch over HTTP | `--bundle-url` / `bundle_urls` fetch through the scope-checked client: budget-charged, audited, refused if the host is out of scope (`exit 2`), and a bundle that yields zero routes prints the prefixes it searched instead of pretending nothing changed. |
+
+A dead host is also now a hard failure rather than a clean report: a host answering `5xx`
+to everything exits **2** with "target unreachable", and no `REPORT.md` / `findings.json`
+is written (`tests/test_transport.py::TestDeadHost`). Zero findings from a silent host and
+zero findings from a secure host must not be the same output.
 
 ## What is still open
 
 | # | Item | Why it matters | Size |
 |---|---|---|---|
 | 1 | **A third-party target run** | the only honest proof. Needs a staging host + accounts. | depends on access |
-| 2 | `429` / `503` backoff with `Retry-After` | today a rate-limited host voids tests; each retry must be budget-charged and audited | ~half day |
 | 3 | Connection reuse | one TLS handshake per request; at 100 ms RTT a 500-request run pays for it | ~half day |
-| 4 | Token refresh hook | long runs outlive a bearer token and the tail of the run 401s | ~half day |
-| 5 | `--deploy-event` (git SHA + service + timestamp) | change detection is still a local bundle-hash diff, not a CI event | 1 day |
 | 6 | OpenAPI / Postman **ingest** | we generate a spec; we do not read one, so a documented API starts from zero inventory | 1 day |
-| 7 | Bundle fetch over HTTP | bundles are read from disk; a live target needs a gated fetch | ~half day |
+| 8 | Credential rotation mid-run | a refresh path is assumed; refresh tokens and re-auth flows are not | 1 day |
+| 9 | Multi-service deploy events | one event, one service; a platform deploy is many | 2 days |
 
-Items 2–4 are transport hardening and do not change any finding. Item 5 is the
-"real-time" claim. Items 6–7 widen the front door.
+Item 3 is the last piece of transport work and changes no finding. Item 6 is the widest
+gap for a documented API. Item 1 is the one that cannot be substituted by anything above.
 
 ## Definition of done
 
@@ -92,3 +119,6 @@ Items 2–4 are transport hardening and do not change any finding. Item 5 is the
    reason, never a guess — **done**.
 5. Deck numbers labelled mock vs real; a real-target run recorded in `targets/proof.json`
    — **open**, gated on item 1.
+6. A retry, a token refresh and a deploy-scoped run are each covered by a test that
+   asserts the *counts* (requests sent, budget spent, audit lines) — **done**
+   (`tests/test_transport.py`: 17 tests, `tests/test_deploy.py`: 32 tests).
