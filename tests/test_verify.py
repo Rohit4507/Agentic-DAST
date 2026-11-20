@@ -295,3 +295,59 @@ class TestInvariants(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReplayNestedIdentity(unittest.TestCase):
+    """Retest must not call a nested-target finding "fixed" on the first replay.
+
+    The replayed response carries its identity at ``data.order.id``; resolving the
+    stored ``identity_field`` at the top level returns ``None`` and reads as a fix.
+    """
+
+    def _capsule(self) -> Capsule:
+        resp = Response(
+            method="GET",
+            url="/v2/orders/o-1",
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"data": {"order": {"id": "o-1", "tenant": "TN-A"}}}).encode(),
+            elapsed_ms=1.0,
+        )
+        capsule = Capsule(finding_id="F-T", title="cross-tenant", endpoint="/v2/orders/{id}", method="GET")
+        capsule.expected = {
+            "status": 200,
+            "identity_field": "data.order.id",
+            "identity_value": "o-1",
+        }
+        capsule.add("as_cross_tenant", resp, role="tenant_b")
+        return capsule
+
+    def test_same_nested_object_is_still_open(self) -> None:
+        from dast.verify.engine import replay_capsule
+        from tests.stub import StubClient
+
+        nested = {"data": {"order": {"id": "o-1", "tenant": "TN-A"}}}
+        client = StubClient({("/v2/orders/o-1", "tenant_b"): (200, nested)})
+        still, detail = replay_capsule(self._capsule(), client)
+        self.assertTrue(still, detail)
+        self.assertIn("still exploitable", detail)
+
+    def test_reworded_response_is_not_a_fix(self) -> None:
+        from dast.verify.engine import replay_capsule
+        from tests.stub import StubClient
+
+        # Same object, identity key renamed: the synonym ladder still recognises it.
+        renamed = {"data": {"order": {"order_id": "o-1", "tenant": "TN-A"}}}
+        client = StubClient({("/v2/orders/o-1", "tenant_b"): (200, renamed)})
+        still, _detail = replay_capsule(self._capsule(), client)
+        self.assertTrue(still)
+
+    def test_other_object_is_a_fix(self) -> None:
+        from dast.verify.engine import replay_capsule
+        from tests.stub import StubClient
+
+        other = {"data": {"order": {"id": "o-2", "tenant": "TN-B"}}}
+        client = StubClient({("/v2/orders/o-1", "tenant_b"): (200, other)})
+        still, detail = replay_capsule(self._capsule(), client)
+        self.assertFalse(still)
+        self.assertIn("resolved", detail)

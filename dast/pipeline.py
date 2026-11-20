@@ -9,6 +9,7 @@ The stage boundaries are explicit because the pack's loop is explicit, and becau
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,10 +20,11 @@ from .attacks import registry
 from .attacks.bola import BolaTarget, candidate_targets, test_cross_tenant_read
 from .attacks.common import FindingFactory
 from .attacks.exposure import test_unauthenticated_exposure
-from .attacks.logic import FlowPaths, LogicContext, test_double_refund, test_fare_tampering, test_skipped_payment
+from .attacks.logic import LogicContext, test_double_refund, test_fare_tampering, test_skipped_payment
 from .audit import AuditLog, audit_head, verify_chain
 from .auth import TokenStore
 from .errors import STOPPING, DastError, ScopeViolation, TransportError
+from .fields import first
 from .gate import ApprovalGate
 from .http import Client
 from .inventory.classify import build_inventory, probe_candidates, render_table, to_dicts
@@ -30,12 +32,14 @@ from .inventory.harvest import harvest_files, union_routes
 from .inventory.openapi import build_spec, write_spec
 from .inventory.traffic import load_asset_map, read_gateway_log
 from .model import ACTIVE, SHADOW, ZOMBIE, EndpointRecord, Finding, TrafficHit, iso, utcnow
+from .profile import StepSpec, TargetProfile
 from .record.har import merge_hits, read_har
 from .report.dedupe import DedupeReport, dedupe
 from .report.sarif import write_sarif
 from .report.ticket import render_index, write_findings
 from .scope import ScopeConfig, ScopeGuard
 from .verify.engine import Capsule, replay_capsule
+from .verify.ledger_source import build_ledger_source
 
 # --------------------------------------------------------------------------------------
 # engagement
@@ -50,6 +54,7 @@ class Engagement:
     tokens: TokenStore
     client: Client
     out: Path
+    profile: TargetProfile = field(default_factory=TargetProfile.mock_defaults)
     started: datetime = field(default_factory=utcnow)
 
     def path(self, *parts: str) -> Path:
@@ -61,6 +66,68 @@ class Engagement:
         return p
 
 
+# --------------------------------------------------------------------------------------
+# profile loading
+# --------------------------------------------------------------------------------------
+
+_DOC_PATH = re.compile(r"\{[^}]+\}")
+
+
+def _norm_route(path: str) -> str:
+    """``/api/ledger/{id}`` and ``/api/ledger/:id`` both become ``/api/ledger``."""
+    path = (path or "/").split("?", 1)[0].split("#", 1)[0]
+    path = _DOC_PATH.sub("", path)
+    path = re.sub(r"/:[A-Za-z_][A-Za-z0-9_]*", "", path)
+    path = re.sub(r"/+", "/", path).rstrip("/")
+    return path or "/"
+
+
+def routes_outside_scope(cfg: ScopeConfig, profile: TargetProfile) -> list[str]:
+    """Flow paths the allowlist does not cover.
+
+    A profile that points at paths the guard will refuse is a configuration bug that
+    presents as "the tests just did not find anything".  Fail at open time instead.
+    """
+    allowed = tuple(_norm_route(p) for p in cfg.allow_paths)
+    denied = tuple(_norm_route(p) for p in cfg.deny_paths)
+    bad: list[str] = []
+    paths = [step.path for step in profile.flows.steps.values()]
+    if profile.ledger.adapter == "http" and profile.ledger.endpoint:
+        paths.append(profile.ledger.endpoint)
+    for raw in paths:
+        route = _norm_route(raw)
+        covered = any(route == a or route.startswith(a + "/") for a in allowed)
+        blocked = any(route == d or route.startswith(d + "/") for d in denied)
+        if not covered or blocked:
+            bad.append(raw)
+    return bad
+
+
+def load_profile(cfg: ScopeConfig, scope_file: Path) -> TargetProfile:
+    """Explicit profile, resolved relative to the scope file; else the mock defaults."""
+    if not cfg.profile:
+        return TargetProfile.mock_defaults()
+    candidate = Path(cfg.profile)
+    if not candidate.is_absolute():
+        candidate = (scope_file.resolve().parent / candidate).resolve()
+    profile = TargetProfile.load(candidate)
+    outside = routes_outside_scope(cfg, profile)
+    if outside:
+        raise DastError(
+            "profile names paths the scope allowlist does not permit: "
+            + ", ".join(sorted(set(outside)))
+            + ". Add them to allow_paths or fix the profile -- otherwise every flow "
+            "test stops at the guard and the run reports nothing."
+        )
+    return profile
+
+
+def _route_present(template: str, present: Iterable[str]) -> bool:
+    """Template equality that tolerates ``{id}`` vs ``:id`` and trailing slashes."""
+    want = _norm_route(template)
+    return any(_norm_route(p) == want for p in present)
+
+
 def open_engagement(
     scope_path: str | Path,
     outdir: str | Path,
@@ -69,14 +136,16 @@ def open_engagement(
     component: str = "pipeline",
     timeout: float = 15.0,
 ) -> Engagement:
-    cfg = ScopeConfig.load(scope_path)
+    scope_file = Path(scope_path)
+    cfg = ScopeConfig.load(scope_file)
+    profile = load_profile(cfg, scope_file)
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     audit = AuditLog(out / "audit.jsonl")
     guard = ScopeGuard(cfg)
     tokens = TokenStore(dict(cfg.accounts))
     client = Client(guard, audit, tokens, component=component, timeout=timeout)
-    eng = Engagement(cfg=cfg, guard=guard, audit=audit, tokens=tokens, client=client, out=out)
+    eng = Engagement(cfg=cfg, guard=guard, audit=audit, tokens=tokens, client=client, out=out, profile=profile)
     audit.note(
         stage="engagement-open",
         engagement=cfg.name,
@@ -86,6 +155,9 @@ def open_engagement(
         deny_paths=list(cfg.deny_paths),
         budget=cfg.max_total_requests,
         approve_writes=approve_writes,
+        profile=profile.name,
+        profile_source=profile.source,
+        profile_summary=profile.summarize(),
     )
     return eng
 
@@ -135,7 +207,9 @@ def collect_inventory(
     for gp in gateway_paths:
         gateway_hits.extend(read_gateway_log(gp))
 
-    js_results = harvest_files([b for b in cfg.js_bundles if Path(b).exists()])
+    js_results = harvest_files(
+        [b for b in cfg.js_bundles if Path(b).exists()], eng.profile.bundle.route_prefixes
+    )
     js_routes = union_routes(js_results)
     asset_map = load_asset_map(cfg.assets_file) if cfg.assets_file else {}
 
@@ -257,15 +331,16 @@ def derive_role_agencies(eng: Engagement, roles: Iterable[str]) -> dict[str, str
     """Which tenant does each test account belong to?
 
     Config first (``role_agencies`` in scope.json), then ask the target's own listing
-    endpoint. If neither works we return nothing for that role and simply do not run
-    cross-tenant tests -- guessing here would manufacture false positives.
+    endpoint -- at whatever path and key the profile names, nested or not.  If neither
+    works we return nothing for that role and simply do not run cross-tenant tests:
+    guessing here would manufacture false positives.
     """
     out = dict(eng.cfg.role_agencies)
-    candidates = ["/api/bookings", "/api/booking", "/api/me", "/api/agency/me"]
+    spec = eng.profile.agency
     for role in roles:
         if role in out:
             continue
-        for path in candidates:
+        for path in spec.probe_paths:
             try:
                 resp = eng.client.get(path, role=role, component="planner", note="role-agency")
             except STOPPING:
@@ -280,12 +355,19 @@ def derive_role_agencies(eng: Engagement, roles: Iterable[str]) -> dict[str, str
                 continue
             if not isinstance(body, dict):
                 continue
-            for key in ("agencyId", "agency", "tenantId", "tenant"):
-                if key in body and body[key]:
-                    out[role] = str(body[key])
-                    break
-            if role in out:
+            value = first(body, spec.fields)
+            if value is not None:
+                out[role] = str(value)
                 break
+    if any(role not in out for role in roles):
+        eng.audit.note(
+            stage="planner",
+            kind="agency-unresolved",
+            roles_missing=[r for r in roles if r not in out],
+            probe_paths=list(spec.probe_paths),
+            fields=list(spec.fields),
+            detail="cross-tenant tests are skipped for these roles",
+        )
     return out
 
 
@@ -301,14 +383,17 @@ def plan_tests(
     """Deterministic, explainable test plan. This is the seam an LLM planner plugs into."""
     plan: list[PlannedTest] = []
     roles = eng.tokens.roles()
+    profile = eng.profile
+    exclude = tuple(profile.bola.exclude_templates)
+    ident = profile.identifiers
 
     # --- cross-tenant object reads on active object-bearing endpoints --------------
     bola_targets: list[BolaTarget] = []
     for rec in inv.records:
         if rec.label != ACTIVE or rec.method != "GET" or "{id}" not in rec.template:
             continue
-        if any(m in rec.template for m in ("/v1/", "/v2/", "/old/", "/test/")):
-            continue  # versioned/legacy routes are covered by the exposure test
+        if any(m in rec.template for m in exclude):
+            continue  # the profile says these routes belong to the exposure test
         ids_by_role = _object_ids_for_template(inv.har_hits, rec.template)
         if not ids_by_role:
             continue
@@ -319,7 +404,12 @@ def plan_tests(
                 roles=[owner_role] + [r for r in roles if r != owner_role],
                 agency_by_role=agency_by_role,
                 owner=rec.owner,
-                limit=bola_object_ids,
+                limit=profile.bola.max_targets_per_id or bola_object_ids,
+                identity_field=ident.identity_field,
+                boundary_field=ident.boundary_field,
+                identity_candidates=ident.identity_candidates,
+                boundary_candidates=ident.boundary_candidates,
+                object_noun=ident.object_noun,
             )
             bola_targets.extend(targets)
             if targets:
@@ -371,39 +461,69 @@ def plan_tests(
         )
 
     # --- business logic on the booking flow ---------------------------------------
+    # The profile decides *which endpoint implements which step*, and a missing step
+    # means the test is not planned at all -- with the reason recorded, so a target
+    # without a rebook route does not look like a target that passed the test.
     present = {r.template for r in inv.records}
+    skipped: list[dict[str, str]] = []
     if include_writes:
-        flow = FlowPaths()
-        for test_id, path, rationale in (
+        flow = profile.flows
+        for test_id, step_name, rationale in (
             (
                 "logic_double_refund",
-                flow.refund,
+                "refund",
                 "Refund endpoint is reachable and the ledger is readable: a second refund after the "
                 "first must violate sigma(refunds) <= sigma(paid).",
             ),
             (
                 "logic_skipped_payment",
-                flow.confirm,
+                "confirm",
                 "Confirm endpoint exists and the ledger exposes payment state: confirming without paying "
                 "must violate CONFIRMED => paid > 0.",
             ),
             (
                 "logic_fare_tampering",
-                flow.rebook,
+                "rebook",
                 "Rebook accepts an amount field on a live booking: a client-supplied value below the "
                 "quote must violate final >= quoted.",
             ),
         ):
-            if path in present:
-                _add_planned(
-                    plan, PlannedTest(test_id=test_id, endpoint=path, rationale=rationale, requires_write=True)
+            step = flow.get(step_name)
+            if step is None:
+                skipped.append({"test_id": test_id, "reason": f"profile has no {step_name!r} step"})
+                continue
+            if not flow.has("hold"):
+                skipped.append({"test_id": test_id, "reason": "flow tests need a 'hold' step to open a booking"})
+                continue
+            if not _route_present(step.path, present):
+                skipped.append(
+                    {
+                        "test_id": test_id,
+                        "reason": f"{step.path} is not an inventoried route",
+                    }
                 )
+                continue
+            if not profile.ledger.usable:
+                skipped.append(
+                    {
+                        "test_id": test_id,
+                        "reason": "no ledger adapter: the invariant cannot be proven, only asserted",
+                    }
+                )
+                continue
+            _add_planned(
+                plan, PlannedTest(test_id=test_id, endpoint=step.path, rationale=rationale, requires_write=True)
+            )
+    if skipped:
+        eng.audit.note(stage="planner", kind="tests-skipped", skipped=skipped)
 
     eng.audit.note(
         stage="plan",
         planned=len(plan),
         by_test={t.test_id: sum(1 for p in plan if p.test_id == t.test_id) for t in plan},
         bola_targets=len(bola_targets),
+        profile=profile.name,
+        skipped=[s["test_id"] for s in skipped],
     )
     return plan, bola_targets
 
@@ -501,7 +621,10 @@ def execute_plan(
             gate=gate,
             factory=factory,
             role=logic_role,
-            owner=owner_for(FlowPaths().refund),
+            owner=owner_for(eng.profile.flows.path("refund")),
+            flow=eng.profile.flows,
+            ledger=build_ledger_source(eng.profile.ledger, eng.client),
+            ids=eng.profile.identifiers,
         )
         runners = {
             "logic_double_refund": test_double_refund,
@@ -673,6 +796,9 @@ def _retest_one(eng: Engagement, d: Path, finding: dict[str, Any], mode: str) ->
             factory=FindingFactory(),
             role=(finding.get("retest") or {}).get("role", "agency_a"),
             owner=finding.get("owner", "unassigned"),
+            flow=eng.profile.flows,
+            ledger=build_ledger_source(eng.profile.ledger, eng.client),
+            ids=eng.profile.identifiers,
         )
         try:
             again = spec.run(ctx)

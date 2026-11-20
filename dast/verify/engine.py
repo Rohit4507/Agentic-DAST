@@ -20,6 +20,7 @@ from typing import Any, Iterable, Mapping
 
 from ..audit import redact_headers, redact_url
 from ..errors import ControlFailure, DastError, ScopeViolation, TransportError, STOPPING
+from ..fields import ID_NAMES, identity_of, same, variants
 from ..http import Client, Response
 from ..model import iso, utcnow
 
@@ -319,8 +320,13 @@ def replay_capsule(capsule: Capsule, client: Client) -> tuple[bool, str]:
             body = resp.json()
         except ValueError:
             return False, "resolved: response is no longer JSON"
-        actual = body.get(field_name) if isinstance(body, dict) else None
-        if str(actual) != str(field_value):
+        if not isinstance(body, dict):
+            return False, "resolved: response is no longer a JSON object"
+        # The identity is a dotted path on most targets, and the synonym ladder means a
+        # reworded response is not the same thing as a fixed bug.  Resolving this at the
+        # top level only would report every nested target as "fixed" on the first retest.
+        path, actual = identity_of(body, (*variants(field_name), *ID_NAMES))
+        if not path or not same(actual, field_value):
             return False, f"resolved: {field_name}={actual!r}, expected {field_value!r}"
 
     return True, "still exploitable: same response shape as the original proof"
@@ -362,12 +368,18 @@ def build_evidence(
 
 
 def compare_identity(
-    owner_resp: Response, other_resp: Response, *, identity_field: str = "bookingId"
+    owner_resp: Response,
+    other_resp: Response,
+    *,
+    identity_field: str = "bookingId",
+    identity_candidates: tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
     """Prove that ``other_resp`` returned the *same object* as ``owner_resp``.
 
-    Returns the extracted cross-boundary facts, or ``None`` if the responses are not
-    the same object (i.e. not a finding).
+    Identity is resolved by dotted path with a synonym ladder (``data.order.id``,
+    ``booking_id``, ``id``), because the key that holds an object's id is a property of
+    the target.  If no candidate resolves on *both* responses we return ``None``: an
+    unprovable match is not a finding.
     """
     try:
         a, b = owner_resp.json(), other_resp.json()
@@ -375,11 +387,21 @@ def compare_identity(
         return None
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None
-    if str(a.get(identity_field)) != str(b.get(identity_field)) or a.get(identity_field) is None:
+    candidates: list[str] = []
+    for path in (*identity_candidates, identity_field, "id", "bookingId", "booking_id"):
+        if path and path not in candidates:
+            candidates.append(path)
+    path_a, value_a = identity_of(a, candidates)
+    path_b, value_b = identity_of(b, candidates)
+    if not path_a or not path_b or value_a is None:
+        return None
+    if not same(value_a, value_b):
         return None
     return {
-        "identity_field": identity_field,
-        "identity_value": a.get(identity_field),
+        "identity_field": path_a,
+        "identity_path_owner": path_a,
+        "identity_path_other": path_b,
+        "identity_value": value_a,
         "owner_view_keys": sorted(a),
         "other_view_keys": sorted(b),
     }

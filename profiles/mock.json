@@ -1,0 +1,87 @@
+{
+  "name": "mock-travel-api",
+  "description": "The bundled deliberately-vulnerable target. This file is the explicit form of the vocabulary version 1 hard-coded in dast/attacks/logic.py.",
+  "flows": {
+    "hold": {
+      "path": "/api/hold",
+      "body": {
+        "pax": "{pax}",
+        "amount": "{amount}"
+      },
+      "id_from": "bookingId"
+    },
+    "pay": {
+      "path": "/api/pay",
+      "body": {
+        "booking": "{id}",
+        "amount": "{amount}"
+      }
+    },
+    "confirm": {
+      "path": "/api/confirm",
+      "body": {
+        "booking": "{id}"
+      }
+    },
+    "cancel": {
+      "path": "/api/cancel",
+      "body": {
+        "booking": "{id}"
+      }
+    },
+    "refund": {
+      "path": "/api/refund",
+      "body": {
+        "booking": "{id}",
+        "amount": "{amount}"
+      }
+    },
+    "rebook": {
+      "path": "/api/rebook",
+      "body": {
+        "booking": "{id}",
+        "amount": "{tampered}"
+      }
+    },
+    "ledger": {
+      "path": "/api/ledger/{id}",
+      "method": "GET"
+    }
+  },
+  "identifiers": {
+    "identity_field": "bookingId",
+    "boundary_field": "agencyId",
+    "object_noun": "booking"
+  },
+  "agency": {
+    "probe_paths": [
+      "/api/bookings",
+      "/api/booking",
+      "/api/me",
+      "/api/agency/me"
+    ],
+    "fields": [
+      "agencyId",
+      "agency",
+      "tenantId",
+      "tenant"
+    ]
+  },
+  "ledger": {
+    "adapter": "http",
+    "endpoint": "/api/ledger/{id}"
+  },
+  "bola": {
+    "exclude_templates": [
+      "/v1/",
+      "/v2/",
+      "/old/",
+      "/test/"
+    ]
+  },
+  "bundle": {
+    "route_prefixes": [
+      "/api/"
+    ]
+  }
+}

@@ -10,44 +10,52 @@ Write operations are gated (:mod:`dast.gate`); reads are not.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..errors import ApprovalDenied, ScopeViolation, TransportError, STOPPING
 from ..gate import ApprovalGate
 from ..http import Client, Response
+from ..fields import first
 from ..model import classify_data
+from ..profile import FlowProfile, FlowPathsView, IdentifierSpec, LedgerSpec, TargetProfile
 from ..report.severity import from_finding_kind
 from ..verify.engine import Capsule, excerpt
 from ..verify.invariants import Ledger, violations
+from ..verify.ledger_source import LedgerSource, build_ledger_source
 from .common import FindingFactory, make_finding
 
 
 @dataclass
-class FlowPaths:
-    """Endpoint map for the booking flow. Override per target; defaults suit the mock."""
-
-    hold: str = "/api/hold"
-    pay: str = "/api/pay"
-    confirm: str = "/api/confirm"
-    cancel: str = "/api/cancel"
-    refund: str = "/api/refund"
-    rebook: str = "/api/rebook"
-    ledger: str = "/api/ledger/{id}"
-
-    def ledger_for(self, booking_id: str) -> str:
-        return self.ledger.replace("{id}", booking_id)
-
-
-@dataclass
 class LogicContext:
+    """Everything a logic test needs, with the target's vocabulary injected.
+
+    ``flow`` is the profile's step map (paths *and* request bodies), ``ledger`` is
+    whichever adapter the profile selected, and ``ids`` says where identity/boundary
+    live in a body.  Nothing here is mock-shaped any more.
+    """
+
     client: Client
     gate: ApprovalGate
     factory: FindingFactory
     role: str
     owner: str = "unassigned"
-    paths: FlowPaths = field(default_factory=FlowPaths)
+    flow: FlowProfile = field(default_factory=lambda: TargetProfile.mock_defaults().flows)
+    ledger: LedgerSource | None = None
+    ids: IdentifierSpec = field(default_factory=IdentifierSpec)
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def paths(self) -> FlowPathsView:
+        """Path view, so report copy can name the target's real endpoints."""
+        return self.flow.view()
+
+    @property
+    def ledger_source(self) -> LedgerSource:
+        if self.ledger is None:
+            self.ledger = build_ledger_source(LedgerSpec(adapter="http", endpoint=self.flow.path("ledger")), self.client)
+        return self.ledger
 
 
 # --------------------------------------------------------------------------------------
@@ -61,41 +69,90 @@ def _call(ctx: LogicContext, method: str, path: str, *, body: Any = None, note: 
     )
 
 
+def _step(ctx: LogicContext, name: str, *, note: str = "", **values: Any) -> Response:
+    """Call a profile step: the body comes from the template, not from literals here.
+
+    A missing step is not an exception -- the planner should not have scheduled the
+    test -- but if it did, the note makes the reason visible instead of blaming the
+    target for a 404.
+    """
+    spec = ctx.flow.get(name)
+    if spec is None:
+        raise ScopeViolation(
+            "no-step",
+            detail=f"profile has no {name!r} step; cannot run this flow",
+        )
+    return _call(ctx, spec.method, spec.url(**values), body=spec.payload(**values), note=note or name)
+
+
 def _ledger(ctx: LogicContext, booking_id: str) -> Ledger | None:
-    try:
-        resp = _call(ctx, "GET", ctx.paths.ledger_for(booking_id), note=f"ledger:{booking_id}")
-    except STOPPING:
-        raise
-    except (ScopeViolation, TransportError) as exc:
-        ctx.notes.append(f"ledger read failed for {booking_id}: {exc}")
-        return None
-    if resp.status != 200:
-        ctx.notes.append(f"ledger read for {booking_id} returned {resp.status}")
+    source = ctx.ledger_source
+    payload = source.read(booking_id, role=ctx.role)
+    if payload is None:
+        ctx.notes.append(source.last_error or f"ledger unreadable for {booking_id}; finding voided")
         return None
     try:
-        return Ledger.from_api(resp.json())
-    except ValueError:
-        ctx.notes.append(f"ledger for {booking_id} was not JSON")
+        return Ledger.from_api(payload)
+    except (TypeError, ValueError) as exc:
+        ctx.notes.append(f"ledger payload for {booking_id} could not be interpreted: {exc}")
         return None
+
+
+def _ledger_evidence(ctx: LogicContext, booking_id: str) -> Response:
+    """The capsule step for the ledger read.
+
+    For an HTTP ledger this is the real response the adapter just consumed.  For a
+    fixture it is the canonical payload the operator exported, clearly labelled as
+    such -- evidence a human can check, not a synthesised "200 OK".
+    """
+    source = ctx.ledger_source
+    raw = getattr(source, "last_response", None)
+    if isinstance(raw, Response):
+        return raw
+    payload = source.read(booking_id, role=ctx.role)
+    body = json.dumps(payload or {}, indent=2).encode("utf-8")
+    return Response(
+        method="GET",
+        url=f"ledger:{source.describe()}",
+        status=200 if payload is not None else 0,
+        headers={"Content-Type": "application/json", "X-Evidence": "operator-export"},
+        body=body,
+        elapsed_ms=0.0,
+    )
 
 
 def _open_booking(ctx: LogicContext, *, amount: float, pax: int = 1) -> tuple[str, Response] | None:
     try:
-        resp = _call(ctx, "POST", ctx.paths.hold, body={"pax": pax, "amount": amount}, note="synthetic-booking")
+        resp = _step(ctx, "hold", note="synthetic-booking", pax=pax, amount=amount)
     except STOPPING:
         raise
-    except (ScopeViolation, TransportError) as exc:
+    except ScopeViolation as exc:
+        ctx.notes.append(f"cannot create a synthetic booking: {exc}")
+        return None
+    except TransportError as exc:
         ctx.notes.append(f"could not create a synthetic booking: {exc}")
         return None
     if resp.status >= 400:
         ctx.notes.append(f"hold returned {resp.status}")
         return None
     try:
-        bid = str(resp.json().get("bookingId"))
-    except (ValueError, AttributeError):
-        ctx.notes.append("hold response had no bookingId")
+        body = resp.json()
+    except ValueError:
+        ctx.notes.append("hold response was not JSON")
         return None
-    return bid, resp
+    if not isinstance(body, dict):
+        ctx.notes.append("hold response was not a JSON object")
+        return None
+    id_from = ctx.flow.get("hold").id_from if ctx.flow.get("hold") else ""
+    candidates = [id_from] if id_from else []
+    candidates.extend(ctx.ids.identity_paths())
+    ident = first(body, candidates)
+    if ident is None:
+        ctx.notes.append(
+            f"hold response had none of {candidates}; set flows.hold.id_from in the profile"
+        )
+        return None
+    return str(ident), resp
 
 
 def _require_write(ctx: LogicContext, action: str, detail: str) -> bool:
@@ -133,10 +190,10 @@ def test_double_refund(ctx: LogicContext, *, amount: float = 1000.0) -> Any | No
     bid, hold_resp = opened
 
     try:
-        pay = _call(ctx, "POST", ctx.paths.pay, body={"booking": bid, "amount": amount}, note="pay")
-        cancel = _call(ctx, "POST", ctx.paths.cancel, body={"booking": bid}, note="cancel")
-        first = _call(ctx, "POST", ctx.paths.refund, body={"booking": bid, "amount": amount}, note="refund-1")
-        second = _call(ctx, "POST", ctx.paths.refund, body={"booking": bid, "amount": amount}, note="refund-2")
+        pay = _step(ctx, "pay", note="pay", id=bid, amount=amount)
+        cancel = _step(ctx, "cancel", note="cancel", id=bid)
+        first = _step(ctx, "refund", note="refund-1", id=bid, amount=amount)
+        second = _step(ctx, "refund", note="refund-2", id=bid, amount=amount)
     except (ScopeViolation, TransportError) as exc:
         ctx.notes.append(f"double-refund flow aborted: {exc}")
         return None
@@ -153,20 +210,20 @@ def test_double_refund(ctx: LogicContext, *, amount: float = 1000.0) -> Any | No
     for label, resp in (("hold", hold_resp), ("pay", pay), ("cancel", cancel),
                         ("refund_1", first), ("refund_2", second)):
         cap.add(label, resp, role=ctx.role)
-    cap.add("ledger", _call(ctx, "GET", ctx.paths.ledger_for(bid), note="ledger-proof"), role=ctx.role)
+    cap.add("ledger", _ledger_evidence(ctx, bid), role=ctx.role)
 
     severity = from_finding_kind("double_refund", money=True, write=True)
     first_line, _ = excerpt(second, max_lines=2)
     impact = (
-        f"`POST {ctx.paths.refund}` accepts a second refund for a booking that is already refunded. "
-        f"On booking {bid} ({ledger.summary_line()}), the ledger shows "
+        f"`POST {ctx.paths.refund}` accepts a second refund for a {ctx.ids.object_noun} that is already refunded. "
+        f"On {ctx.ids.object_noun} {bid} ({ledger.summary_line()}), the ledger shows "
         f"{ledger.successful_refunds} successful refunds totalling {ledger.refunded:.2f} against "
         f"{ledger.paid:.2f} paid. Each replay of the same request moves money again: "
         f"{next((r.detail for r in broken), '')}. "
         f"Nothing in the request changes between calls, so this is replayable at will."
     )
     remediation = (
-        "Make refund issuance idempotent and state-guarded in one transaction: lock the booking row, "
+        "Make refund issuance idempotent and state-guarded in one transaction: lock the record, "
         "reject when `refunds.any(status == 'settled')`, and require a client-supplied idempotency key. "
         "Enforce the ledger invariant `Σrefunds ≤ Σpayments` in the database as a constraint so a "
         "future handler cannot regress it. Last response: " + first_line.replace("\n", " ")[:200]
@@ -174,7 +231,7 @@ def test_double_refund(ctx: LogicContext, *, amount: float = 1000.0) -> Any | No
 
     finding = make_finding(
         factory=ctx.factory,
-        title=f"Double refund — booking {bid} was refunded twice",
+        title=f"Double refund — {ctx.ids.object_noun} {bid} was refunded twice",
         vuln_class="double_refund",
         method="POST",
         endpoint=ctx.paths.refund,
@@ -217,7 +274,7 @@ def test_skipped_payment(ctx: LogicContext, *, amount: float = 750.0) -> Any | N
     bid, hold_resp = opened
 
     try:
-        confirm = _call(ctx, "POST", ctx.paths.confirm, body={"booking": bid}, note="confirm-without-payment")
+        confirm = _step(ctx, "confirm", note="confirm-without-payment", id=bid)
     except (ScopeViolation, TransportError) as exc:
         ctx.notes.append(f"skipped-payment flow aborted: {exc}")
         return None
@@ -233,14 +290,14 @@ def test_skipped_payment(ctx: LogicContext, *, amount: float = 750.0) -> Any | N
     cap = _base_capsule(ctx, "Skipped payment step", "POST", ctx.paths.confirm)
     cap.add("hold", hold_resp, role=ctx.role)
     cap.add("confirm_without_payment", confirm, role=ctx.role)
-    cap.add("ledger", _call(ctx, "GET", ctx.paths.ledger_for(bid), note="ledger-proof"), role=ctx.role)
+    cap.add("ledger", _ledger_evidence(ctx, bid), role=ctx.role)
 
     severity = from_finding_kind("skipped_payment", money=True, write=True)
     impact = (
-        f"`POST {ctx.paths.confirm}` moves a booking to CONFIRMED with no payment recorded. "
-        f"Booking {bid}: status={ledger.status}, paid={ledger.paid:.2f}, quoted={ledger.quoted:.2f}. "
+        f"`POST {ctx.paths.confirm}` moves a {ctx.ids.object_noun} to CONFIRMED with no payment recorded. "
+        f"{ctx.ids.object_noun.capitalize()} {bid}: status={ledger.status}, paid={ledger.paid:.2f}, quoted={ledger.quoted:.2f}. "
         f"The state machine permits the transition HELD -> CONFIRMED, skipping PAY, so a caller that "
-        f"never calls `{ctx.paths.pay}` still gets a confirmed, ticketed booking — an unpaid "
+        f"never calls `{ctx.paths.pay}` still gets a confirmed, ticketed {ctx.ids.object_noun} — an unpaid "
         f"reservation that suppliers will honour. "
         f"{next((r.detail for r in broken), '')}"
     )
@@ -253,7 +310,7 @@ def test_skipped_payment(ctx: LogicContext, *, amount: float = 750.0) -> Any | N
 
     return make_finding(
         factory=ctx.factory,
-        title=f"Skipped payment — booking {bid} confirmed with {ledger.paid:.2f} paid",
+        title=f"Skipped payment — {ctx.ids.object_noun} {bid} confirmed with {ledger.paid:.2f} paid",
         vuln_class="skipped_payment",
         method="POST",
         endpoint=ctx.paths.confirm,
@@ -294,9 +351,7 @@ def test_fare_tampering(ctx: LogicContext, *, quoted: float = 5000.0, tampered: 
     bid, hold_resp = opened
 
     try:
-        rebook = _call(
-            ctx, "POST", ctx.paths.rebook, body={"booking": bid, "amount": tampered}, note="fare-tamper"
-        )
+        rebook = _step(ctx, "rebook", note="fare-tamper", id=bid, quoted=quoted, tampered=tampered)
     except (ScopeViolation, TransportError) as exc:
         ctx.notes.append(f"fare-tamper flow aborted: {exc}")
         return None
@@ -312,12 +367,12 @@ def test_fare_tampering(ctx: LogicContext, *, quoted: float = 5000.0, tampered: 
     cap = _base_capsule(ctx, "Fare tampering", "POST", ctx.paths.rebook)
     cap.add("hold", hold_resp, role=ctx.role)
     cap.add("rebook_with_client_amount", rebook, role=ctx.role)
-    cap.add("ledger", _call(ctx, "GET", ctx.paths.ledger_for(bid), note="ledger-proof"), role=ctx.role)
+    cap.add("ledger", _ledger_evidence(ctx, bid), role=ctx.role)
 
     severity = from_finding_kind("fare_tampering", money=True, write=True)
     impact = (
-        f"`POST {ctx.paths.rebook}` writes the client-supplied `amount` straight into the booking's "
-        f"final amount. Booking {bid} was quoted {ledger.quoted:.2f} and rebooked at "
+        f"`POST {ctx.paths.rebook}` writes the client-supplied `amount` straight into the {ctx.ids.object_noun}'s "
+        f"final amount. {ctx.ids.object_noun.capitalize()} {bid} was quoted {ledger.quoted:.2f} and rebooked at "
         f"{ledger.final:.2f}, a {100 * (1 - ledger.final / ledger.quoted):.1f}% reduction chosen by the "
         f"caller. Any agency (or a compromised sub-agent) can therefore set its own fare, and the "
         f"supplier is invoiced at the reduced value. {next((r.detail for r in broken), '')}"
@@ -331,7 +386,10 @@ def test_fare_tampering(ctx: LogicContext, *, quoted: float = 5000.0, tampered: 
 
     return make_finding(
         factory=ctx.factory,
-        title=f"Fare tampering — booking {bid} rebooked at {ledger.final:.2f} against a {ledger.quoted:.2f} quote",
+        title=(
+            f"Fare tampering — {ctx.ids.object_noun} {bid} rebooked at "
+            f"{ledger.final:.2f} against a {ledger.quoted:.2f} quote"
+        ),
         vuln_class="fare_tampering",
         method="POST",
         endpoint=ctx.paths.rebook,

@@ -17,7 +17,8 @@ from typing import Any, Iterable
 
 from ..errors import ControlFailure, ScopeViolation, TransportError, STOPPING
 from ..http import Client, Response
-from ..model import classify_data
+from ..fields import first
+from ..model import classify_data, deep_keys
 from ..report.severity import from_finding_kind
 from ..verify.engine import Capsule, compare_identity, negative_control, redact_body
 from .common import FindingFactory, make_finding
@@ -36,6 +37,10 @@ class BolaTarget:
     identity_field: str = "bookingId"
     boundary_field: str = "agencyId"
     owner: str = "unassigned"
+    #: Dotted-path ladders from the profile; empty means "the fields above, then synonyms".
+    identity_candidates: tuple[str, ...] = ()
+    boundary_candidates: tuple[str, ...] = ()
+    object_noun: str = "booking"
 
 
 def _safe_json(resp: Response) -> dict[str, Any] | None:
@@ -95,13 +100,18 @@ def test_cross_tenant_read(
         return None
 
     # 4. same object? (not a generic page that merely returns 200)
-    identity = compare_identity(owner_resp, other_resp, identity_field=target.identity_field)
+    identity = compare_identity(
+        owner_resp,
+        other_resp,
+        identity_field=target.identity_field,
+        identity_candidates=target.identity_candidates,
+    )
     if identity is None:
         notes.append(f"{path}: responses are not the same object; discarding")
         return None
 
     other_body = _safe_json(other_resp) or {}
-    caller_agency = other_body.get(target.boundary_field)
+    caller_agency = first(other_body, [*target.boundary_candidates, target.boundary_field])
 
     # 5. cross a real tenant boundary (this is what makes it a *security* finding)
     if caller_agency is None:
@@ -111,11 +121,11 @@ def test_cross_tenant_read(
         notes.append(f"{path}: {target.other_role} received its own object; not a finding")
         return None
 
-    # 6. did real data come back?
-    exposed_keys = [k for k in other_body if k.lower() in PII_PROOF_KEYS]
-    if isinstance(other_body.get("traveller"), dict):
-        exposed_keys += [f"traveller.{k}" for k in other_body["traveller"] if k.lower() in PII_PROOF_KEYS]
-    data_classes = classify_data(sorted(other_body))
+    # 6. did real data come back?  Census every key at every depth: a wrapper object
+    # whose only sensitive content is nested is the normal real-world case.
+    all_keys = deep_keys(other_body)
+    exposed_keys = [k for k in all_keys if k in PII_PROOF_KEYS]
+    data_classes = classify_data(all_keys)
 
     capsule = Capsule(finding_id="", title="", endpoint=target.template, method="GET")
     capsule.expected = {
@@ -138,17 +148,18 @@ def test_cross_tenant_read(
         write=False,
     )
 
-    endpoint_display = target.template.replace("{id}", f"{{{target.identity_field}}}")
+    noun = target.object_noun
+    endpoint_display = target.template.replace("{id}", f"{{{noun} id}}")
     title = (
         f"Cross-tenant read: {target.other_role} can read {target.owner_agency} "
-        f"{target.identity_field} {identity['identity_value']}"
+        f"{noun} {identity['identity_value']}"
     )
     impact = (
-        f"A token issued to {target.other_role} ({target.other_agency}) retrieves a booking owned by "
+        f"A token issued to {target.other_role} ({target.other_agency}) retrieves a {noun} owned by "
         f"{target.owner_agency} from `GET {target.template}`. The handler authenticates the caller but "
         f"never compares the object's {target.boundary_field} with the caller's tenant, so any "
-        f"authenticated agency can read any other agency's booking by supplying its id — including "
-        f"{', '.join(exposed_keys) if exposed_keys else 'booking detail'}."
+        f"authenticated agency can read any other agency's {noun} by supplying its id — including "
+        f"{', '.join(exposed_keys) if exposed_keys else noun + ' detail'}."
     )
     remediation = (
         f"Enforce object ownership in the authorization layer rather than the handler: reject the request "
@@ -172,6 +183,8 @@ def test_cross_tenant_read(
         remediation=remediation,
         extracted={
             "object_id": identity["identity_value"],
+            "identity_field": identity["identity_field"],
+            "boundary_field": target.boundary_field,
             "owner_agency": target.owner_agency,
             "caller_role": target.other_role,
             "caller_agency": str(caller_agency),
@@ -194,6 +207,11 @@ def candidate_targets(
     agency_by_role: dict[str, str],
     owner: str,
     limit: int = 3,
+    identity_field: str = "bookingId",
+    boundary_field: str = "agencyId",
+    identity_candidates: tuple[str, ...] = (),
+    boundary_candidates: tuple[str, ...] = (),
+    object_noun: str = "booking",
 ) -> list[BolaTarget]:
     """Build owner/other role pairs for one object-bearing endpoint.
 
@@ -220,6 +238,11 @@ def candidate_targets(
                         other_agency=a_other,
                         object_id=str(oid),
                         owner=owner,
+                        identity_field=identity_field,
+                        boundary_field=boundary_field,
+                        identity_candidates=identity_candidates,
+                        boundary_candidates=boundary_candidates,
+                        object_noun=object_noun,
                     )
                 )
     return out

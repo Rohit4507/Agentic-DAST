@@ -168,6 +168,8 @@ model explores, code validates.**
 run.py                      one command: all | inventory | guard-demo | retest | diff | catalogue
 scope.json                  the allowlist — written by a human, read-only to everything else
 assets.json                 asset ownership (provided input), longest-prefix match
+profiles/                   target vocabulary (paths, bodies, field names) — one file per API
+scope2.json                 a second engagement pointing at the second target
 dast/
   scope.py                  fail-closed allowlist, token bucket, budget, kill switch, strain backoff
   audit.py                  append-only JSONL with a hash chain + redaction
@@ -176,14 +178,18 @@ dast/
   gate.py                   human-approval gate for write tests (fails closed)
   model.py                  EndpointRecord / Finding / TrafficHit + path templating
   pipeline.py               inventory -> plan -> execute -> verify -> report -> retest
+  profile.py                the target profile: fail-closed validation of a target's vocabulary
+  fields.py                 dotted-path resolution (data.order.id) + money/number coercion
   cli.py                    the commands above
   record/                   HAR reading/writing, journey recorder (stdlib + optional Playwright)
   inventory/                JS harvest, gateway-log correlation, three-way classification, OpenAPI
   attacks/                  BOLA, business-logic, unauthenticated exposure + the test library
   verify/                   proof capsules, negative controls, redaction, invariants
+  verify/ledger_source.py   ledger adapters: http statement | exported fixture | none
   report/                   ticket markdown, SARIF, severity, dedupe
-target/                     deliberately vulnerable mock travel API (see target/README.md)
-tests/                     112 stdlib unittest tests, including the precision cases
+target/                     deliberately vulnerable mock travel API (/api/..., flat JSON)
+target2/                    second vulnerable API (/v2/..., nested JSON, different field names)
+tests/                     179 stdlib unittest tests, including the precision and genericity cases
 captures/                   recorded journeys, the "provided HAR" input
 ```
 
@@ -196,7 +202,7 @@ python run.py catalogue                # the test library (the planner's enum)
 python run.py guard-demo               # 8 out-of-scope attempts, all refused; exit code 1 if any passes
 python run.py retest                   # replay capsules / re-execute logic, auto-close fixed
 python run.py diff --bundle target/static/app.js   # route delta since the last run
-python -m unittest discover -s tests -t .          # 112 tests
+python -m unittest discover -s tests -t .          # 179 tests
 ```
 
 Without `--approve-writes`, write tests are **skipped and reported as such** — the gate
@@ -224,17 +230,58 @@ kill file or a spent budget ends the engagement; it must never degrade into a qu
 
 ## Running it against a real target
 
-1. Replace `base_url`, `allow_hosts`, `allow_paths`, `deny_paths` and `accounts` in
-   `scope.json`. Credentials stay as `env:VAR` references; they are resolved at request
-   time and never logged.
-2. Record journeys: `dast/record/journey.py:record_with_playwright()` drives the UI per
-   role and writes a HAR (needs `pip install playwright`). Or drop in the provided HARs.
-3. Point `--gateway` at the 30–90 day gateway log (JSONL or combined log format).
-4. Set `js_bundles` to the front-end bundles, and `assets_file` to the ownership table.
-5. `python run.py all`.
+Version 1 of this tool knew one vocabulary: `/api/...`, flat JSON, `bookingId`,
+`agencyId`, and a `GET /api/ledger/{id}` endpoint. Pointed at any other API it did not
+crash — it went quiet, which is the worst possible failure for a DAST tool. The
+vocabulary now lives in a **target profile**, validated fail-closed.
 
-If a signal is missing, the pipeline says so rather than guessing — no gateway log means
-"last traffic: never", not "active".
+```bash
+cp profiles/mock.json profiles/acme.json     # then edit:
+#   flows.*          the paths and request bodies this API uses for hold/pay/refund/rebook
+#   flows.hold.id_from   where the created object's id comes back (dotted path)
+#   identifiers.*    where identity and tenant boundary live (dotted paths)
+#   ledger.*         how to read money back: http endpoint + field map, or an export
+#   agency.*         how to learn each role's tenant from the API itself
+#   bola.*           which routes are *not* worth a cross-tenant replay
+#   bundle.*         the path prefixes your front-end routes live under
+```
+
+Then in `scope.json` add `"profile": "profiles/acme.json"` and set `base_url`,
+`allow_hosts`, `allow_paths`, `deny_paths`, `accounts`, `js_bundles`, `assets_file`.
+Credentials stay `env:VAR` references — resolved at request time, never logged.
+
+The pipeline refuses to start if the profile names paths the allowlist does not cover.
+That check exists because the alternative is a run that silently stops at the guard and
+reports "no findings".
+
+If a signal is missing the pipeline says so rather than guessing: no gateway log means
+"last traffic: never", not "active"; no ledger adapter means the logic tests are
+skipped **with that reason recorded**, never asserted.
+
+### Two targets, one scanner
+
+`target2/` is a second deliberately-vulnerable API built to break every assumption the
+mock embodied: `/v2/` prefixes, everything nested under `data`, `tenant` instead of
+`agencyId`, `value`/`state` instead of `amount`/`status`, `settlements`/`reversals`
+instead of `payments`/`refunds`, and a statement endpoint instead of a ledger.
+
+Same vulnerability classes, same code path, one profile apart:
+
+| | mock (`target/`) | target2 (`target2/`) |
+|---|---|---|
+| Endpoints | 13 (9/1/3) | 10 (8/1/1) |
+| Verified findings | 7 | 5 |
+| Cross-tenant proof | `bookingId` / `agencyId` | `data.order.id` / `data.order.tenant` |
+| Ledger | `GET /api/ledger/{id}` | `GET /v2/orders/{id}/statement` → mapped |
+| Requests | 39 | 34 |
+
+`tests/test_genericity.py` runs both, and also runs target2 **with the mock's profile**
+to prove the profile is load-bearing: with the wrong vocabulary the
+identity-dependent tests go quiet while route-driven exposure still fires. That is the
+silent false-negative this layer removes.
+
+Honest status: this has never run against a third-party API. The next checkpoint is a
+staging target with real accounts — see `deck/REALWORLD_PLAN.md`.
 
 ## How this maps to the judging criteria
 
