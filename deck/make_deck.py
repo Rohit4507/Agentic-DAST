@@ -232,7 +232,7 @@ def slide_cover(pdf: PDF) -> None:
         ("7", "VERIFIED FINDINGS", "2 critical, 5 high"),
         ("13", "ENDPOINTS MAPPED", "9 active, 1 shadow, 3 zombie"),
         ("39", "REQUESTS AUDITED", "0 denied, 81 of 120 left"),
-        ("112", "TESTS PASSING", "standard library only"),
+        ("228", "TESTS PASSING", "standard library only"),
     ]
     for i, (num, label, note) in enumerate(stats):
         x = M + i * 214
@@ -327,10 +327,10 @@ FINDINGS = [
 PLAN = [
     ("W1  26 NOV - 3 DEC", "Real inputs and the trigger",
      "Live HAR per role, gateway and DNS adapters, deploy webhook.",
-     "delta run: max 5 requests, under 5 s"),
+     "delta run: 17 requests, 1.1 s today"),
     ("W2  4 - 10 DEC", "Catalogue 5 to 11",
      "Auth, injection and hygiene tests, each with a silence test.",
-     "11 of 16 implemented, 5 classes"),
+     "5 of 16 today, 11 by 10 Dec"),
     ("W3  11 - 17 DEC", "Publish the speed number",
      "GitHub Action, SARIF upload, deploy-to-finding per run.",
      "p50 under 10 min over 10 runs"),
@@ -417,10 +417,10 @@ def slide_close(pdf: PDF) -> None:
          "inventory that carries an owner and a recommendation."),
         ("WHY IT WINS",
          "Precision and safety are 40% of the rubric, and both are structural: a negative "
-         "control on every test, and an allowlist the scanner cannot reach."),
+         "control on every route-driven test, and an allowlist the scanner cannot reach."),
         ("WHAT IS NEXT",
-         "Four weeks to the live platform: real inputs and a deploy trigger, 11 of 16 tests "
-         "implemented, and a published deploy-to-finding time."),
+         "Four weeks to the live platform: real inputs and a deploy trigger, 5 of 16 tests "
+         "implemented today (11 by 24 Dec), and a published deploy-to-finding time."),
     ]
     cw = 248.0
     for i, (head, body) in enumerate(cols):
