@@ -6,6 +6,8 @@ features would only make the video longer, not more convincing. The one thing th
 make the submission stronger — a run against a third-party API — needs staging access,
 not code.
 
+Hinglish narration: `deck/VIDEO_SCRIPT_HINGLISH.md` (same shot list, same timings).
+
 Everything below is measured, not estimated: `bash deck/video/verify_numbers.sh` re-runs
 the whole sequence and asserts each figure against the deck.
 
