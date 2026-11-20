@@ -20,7 +20,9 @@ from typing import Any
 from . import __version__
 from .attacks import registry
 from .audit import verify_chain
+from .deploy import DeployEvent, DeployState, assess
 from .errors import ApprovalDenied, BudgetExhausted, DastError, KillSwitchEngaged, ScopeViolation
+from .http import TransportOptions
 from .inventory.classify import render_table
 from .inventory.harvest import (
     changed_bundles,
@@ -65,6 +67,63 @@ def _gateway_paths(value: str) -> list[Path]:
     return [p] if p.exists() else []
 
 
+def _transport_args(parser: argparse.ArgumentParser) -> None:
+    """Transport policy.  Every retry is charged to the budget and audited, so these
+    knobs change how patient a run is, never how much it is allowed to do."""
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="retries on 429/503, each charged and audited (default 2; 0 disables)",
+    )
+    parser.add_argument(
+        "--retry-max-wait",
+        type=float,
+        default=10.0,
+        help="cap on a single Retry-After wait, seconds (default 10)",
+    )
+    parser.add_argument(
+        "--max-wall-clock",
+        type=float,
+        default=0.0,
+        help="stop the run after N seconds, exit 4 (default 0 = no limit)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="per-request timeout, seconds (default 15)",
+    )
+
+
+def _deploy_args(p: argparse.ArgumentParser) -> None:
+    """A deploy event makes the loop incremental: test what changed, skip what did not."""
+    p.add_argument(
+        "--deploy-event",
+        default="",
+        help="CI event JSON; its changed routes are tested first",
+    )
+    p.add_argument(
+        "--deploy-state",
+        default="",
+        help="where the last processed deploy is remembered (default: <out>/deploy_state.json)",
+    )
+    p.add_argument(
+        "--changed-only",
+        action="store_true",
+        help="test only the routes the deploy touched, and say how many were deferred",
+    )
+
+
+def _transport(args: argparse.Namespace) -> TransportOptions:
+    return TransportOptions(
+        timeout=float(getattr(args, "timeout", 15.0) or 15.0),
+        retries=int(getattr(args, "retries", 2) or 0),
+        retry_max_wait=float(getattr(args, "retry_max_wait", 10.0) or 0.0),
+        max_wall_clock=float(getattr(args, "max_wall_clock", 0.0) or 0.0),
+    )
+
+
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--scope", default=DEFAULT_SCOPE, help="scope allowlist JSON (default: scope.json)")
     parser.add_argument("--out", default=DEFAULT_OUT, help="output directory (default: work/)")
@@ -75,6 +134,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-writes", action="store_true", help="skip all write/logic tests")
     parser.add_argument("--max-probes", type=int, default=15, help="cap on inventory probes")
     parser.add_argument("--json", action="store_true", help="machine-readable summary on stdout")
+    _transport_args(parser)
 
 
 # --------------------------------------------------------------------------------------
@@ -82,10 +142,30 @@ def _common(parser: argparse.ArgumentParser) -> None:
 # --------------------------------------------------------------------------------------
 
 
+def _deploy_priority(args: argparse.Namespace, out: str | Path) -> tuple[list[str], str]:
+    """Routes the last processed deploy touched, and the flag that asked us to only run them."""
+    if getattr(args, "deploy_event", ""):
+        event = DeployEvent.load(args.deploy_event)
+        return event.routes(), f"event {event.sha[:8]}"
+    state_path = Path(getattr(args, "deploy_state", "") or Path(out) / "deploy_state.json")
+    if not state_path.exists():
+        return [], ""
+    state = DeployState.load(state_path)
+    if not state.routes:
+        return [], ""
+    return list(state.routes), f"deploy {state.sha[:8]}"
+
+
 def cmd_all(args: argparse.Namespace) -> int:
-    eng = open_engagement(args.scope, args.out, approve_writes=args.approve_writes)
+    eng = open_engagement(args.scope, args.out, approve_writes=args.approve_writes, transport=_transport(args))
     print(eng.cfg.summarize())
     gateway = _gateway_paths(args.gateway)
+    priority, priority_source = _deploy_priority(args, args.out)
+    if priority:
+        verb = "only these" if args.changed_only else "first"
+        print(f"deploy priority ({priority_source}): {len(priority)} route(s), testing {verb}")
+        for route in priority:
+            print(f"  * {route}")
 
     result = run_all(
         eng,
@@ -95,6 +175,8 @@ def cmd_all(args: argparse.Namespace) -> int:
         include_writes=not args.no_writes,
         probe=not args.no_probe,
         max_probes=args.max_probes,
+        priority=priority,
+        only_priority=bool(args.changed_only and priority),
         on_inventory=lambda inv: _rule("INVENTORY (discovery + zombie/shadow)") or print(render_table(inv.records)),
     )
 
@@ -132,7 +214,7 @@ def cmd_all(args: argparse.Namespace) -> int:
 
 
 def cmd_inventory(args: argparse.Namespace) -> int:
-    eng = open_engagement(args.scope, args.out)
+    eng = open_engagement(args.scope, args.out, transport=_transport(args))
     gateways = _gateway_paths(args.gateway)
     inv = collect_inventory(
         eng,
@@ -166,7 +248,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_retest(args: argparse.Namespace) -> int:
-    eng = open_engagement(args.scope, args.out)
+    eng = open_engagement(args.scope, args.out, transport=_transport(args))
     root = Path(args.out) / "findings"
     if not root.exists():
         print(f"no findings directory at {root}; run 'python run.py all' first", file=sys.stderr)
@@ -208,7 +290,7 @@ def cmd_catalogue(args: argparse.Namespace) -> int:
 
 def cmd_guard_demo(args: argparse.Namespace) -> int:
     """Prove the safety layer refuses things. Deliberately tries to break scope."""
-    eng = open_engagement(args.scope, args.out)
+    eng = open_engagement(args.scope, args.out, transport=_transport(args))
     base = eng.cfg.base_url
     attempts = [
         ("off-allowlist host", "GET", "https://example.com/api/bookings"),
@@ -258,9 +340,112 @@ def cmd_guard_demo(args: argparse.Namespace) -> int:
     return 0 if refused == len(attempts) and allowed == 2 else 1
 
 
+def _fetch_bundles(eng: Any, urls: list[str]) -> tuple[dict[str, str], set[str]]:
+    """Fetch bundle URLs through the gated client: audited, budgeted, scope-checked."""
+    hashes: dict[str, str] = {}
+    routes: set[str] = set()
+    for url in urls:
+        resp = eng.client.get(url, component="change", note="bundle-fetch")
+        if resp.status != 200:
+            print(f"  bundle {url} -> {resp.status}; ignored", file=sys.stderr)
+            continue
+        from .inventory.harvest import harvest_text
+
+        prefixes = eng.profile.bundle.route_prefixes
+        found = harvest_text(resp.text, prefixes)
+        import hashlib
+
+        hashes[url] = hashlib.sha256(resp.body).hexdigest()
+        routes |= found
+        print(f"  bundle {url}: {len(found)} route(s), sha256:{hashes[url][:12]}")
+        if not found:
+            # Silence here would look identical to "nothing changed", which is worse
+            # than a warning: say which prefixes were searched.
+            print(
+                f"  warning: no route starting with {', '.join(prefixes) or '<none>'} in {url}; "
+                "check bundle.route_prefixes in the profile",
+                file=sys.stderr,
+            )
+    return hashes, routes
+
+
+def _diff_deploy_event(eng: Any, args: argparse.Namespace) -> int:
+    event = DeployEvent.load(args.deploy_event)
+    state_path = Path(args.out) / "deploy_state.json"
+    previous = DeployState.load(state_path)
+
+    if previous.already_processed(event):
+        print(f"deploy {event.sha[:8]} already processed at {previous.processed_at or 'an earlier run'}")
+        print(f"  {len(previous.routes)} route(s) were prioritised then; nothing to do")
+        if args.json:
+            print(json.dumps({"status": "already-processed", "state": previous.to_dict()}, indent=2))
+        return 0
+
+    print(f"deploy {event.sha[:8]}  {event.service or '<no service>'}  {event.at or '<no timestamp>'}")
+    if event.actor:
+        print(f"  actor: {event.actor}")
+    if event.changed_paths:
+        print(f"  changed paths ({len(event.changed_paths)}):")
+        for path in event.changed_paths:
+            print(f"    - {path}")
+
+    bundle_hashes: dict[str, str] = {}
+    bundle_routes: set[str] = set()
+    urls = list(event.bundle_urls) + list(getattr(args, "bundle_url", []) or [])
+    if urls:
+        print("  fetching bundles through the guard:")
+        bundle_hashes, bundle_routes = _fetch_bundles(eng, urls)
+
+    assessment = assess(
+        event,
+        inventory_path=Path(args.out) / "inventory.json",
+        previous=previous,
+        bundle_routes=bundle_routes,
+    )
+
+    print()
+    print(assessment.summary())
+    if assessment.new_routes:
+        print(f"  new since deploy {previous.sha[:8] or '<baseline>'}: {len(assessment.new_routes)} route(s)")
+        for route in assessment.new_routes:
+            print(f"    * {route}")
+    if assessment.to_test:
+        print("  test these first:")
+        for route in assessment.to_test:
+            print(f"    + {route}")
+    if assessment.not_inventoried:
+        print("  not yet inventoried (run 'python run.py inventory' to map them):")
+        for route in assessment.not_inventoried:
+            print(f"    ? {route}")
+    if assessment.removed:
+        print("  gone from the bundle (candidate for decommissioning if it still answers):")
+        for route in assessment.removed:
+            print(f"    - {route}")
+
+    new_state = previous.record(
+        event, assessment.to_test, now=utcnow(), bundle_routes=assessment.bundle_routes
+    ).save(state_path)
+    print()
+    print(f"state -> {new_state}")
+    eng.audit.note(
+        stage="change",
+        kind="deploy-event",
+        sha=event.sha,
+        service=event.service,
+        routes=assessment.to_test,
+        not_inventoried=assessment.not_inventoried,
+        bundle_hashes=bundle_hashes,
+    )
+    if args.json:
+        print(json.dumps(assessment.to_dict(), indent=2))
+    return 0
+
+
 def cmd_diff(args: argparse.Namespace) -> int:
-    """Detect change: bundle hash diff -> route delta -> what to test now."""
-    eng = open_engagement(args.scope, args.out)
+    """Detect change: a CI deploy event (preferred) or a bundle hash diff."""
+    eng = open_engagement(args.scope, args.out, transport=_transport(args))
+    if getattr(args, "deploy_event", ""):
+        return _diff_deploy_event(eng, args)
     state_file = eng.out / "bundle_state.json"
     state = load_bundle_state(state_file)
     bundles = list(args.bundle) if args.bundle else list(eng.cfg.js_bundles)
@@ -314,6 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_all = sub.add_parser("all", help="run the full loop (inventory -> plan -> execute -> report)")
     _common(p_all)
+    _deploy_args(p_all)
     p_all.set_defaults(func=cmd_all)
 
     p_inv = sub.add_parser("inventory", help="discovery + active/zombie/shadow labelling only")
@@ -322,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_scan = sub.add_parser("scan", help="alias for 'all'")
     _common(p_scan)
+    _deploy_args(p_scan)
     p_scan.set_defaults(func=cmd_scan)
 
     p_re = sub.add_parser("retest", help="re-run stored findings and auto-close fixed ones")
@@ -329,6 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_re.add_argument("--out", default=DEFAULT_OUT)
     p_re.add_argument("--finding", default="", help="retest a single finding id (e.g. F-001)")
     p_re.add_argument("--json", action="store_true")
+    _transport_args(p_re)
     p_re.set_defaults(func=cmd_retest, captures="", gateway="", approve_writes=False,
                       no_probe=True, no_writes=False, max_probes=0)
 
@@ -346,7 +534,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("--scope", default=DEFAULT_SCOPE)
     p_diff.add_argument("--out", default=DEFAULT_OUT)
     p_diff.add_argument("--bundle", action="append", default=[])
+    p_diff.add_argument(
+        "--deploy-event",
+        default="",
+        help="JSON from CI: {sha, service, at, changed_paths[], bundle_urls[]}",
+    )
+    p_diff.add_argument(
+        "--bundle-url",
+        action="append",
+        default=[],
+        help="fetch a bundle over the scope-checked client (repeatable)",
+    )
     p_diff.add_argument("--json", action="store_true")
+    _transport_args(p_diff)
     p_diff.set_defaults(func=cmd_diff)
     return ap
 

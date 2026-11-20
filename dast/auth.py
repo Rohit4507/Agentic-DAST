@@ -58,6 +58,16 @@ class TokenStore:
         self._cache[role] = val
         return val
 
+    def update(self, role: str, token: str) -> None:
+        """Replace a cached token after a refresh.
+
+        Only the cache is written; the ``accounts`` mapping (``env:VAR``) is untouched, so
+        an operator's export is still the source of truth for the next run.
+        """
+        if not isinstance(token, str) or not token.strip():
+            raise DastError(f"refusing to store an empty token for role {role!r}")
+        self._cache[role] = token
+
     def headers(self, role: str) -> dict[str, str]:
         return {self.header_name: f"{self.scheme} {self.get(role)}".strip()}
 
