@@ -157,6 +157,9 @@ Point karo: `touched 3 changed path(s); 3 route(s) to test first` →
   bolna hai, par us waqt mouse `7` par ho).
 - Yeh mat bolna: "AI agent API hack karta hai", "production-ready", "kisi bhi API par
   kaam karta hai", "real platforms par validated", "30 findings".
+- Do specific traps (dekho `deck/DECK_AUDIT.md`): ❌ "negative control har test par hai"
+  (hai 4 of 7 — route-driven par; logic findings ledger arithmetic se prove hote hain) aur
+  ❌ "AI agent decide karta hai" (planner enum se chunta hai; verifier deterministic hai).
 - Honest line (Beat 8) ko mat kaatna — wahi line credibility deti hai.
 
 ## 60-second cut (Hinglish)

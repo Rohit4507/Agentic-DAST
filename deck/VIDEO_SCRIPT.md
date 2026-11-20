@@ -53,6 +53,9 @@ run). Do **not** reset between verifying and recording.
 Say: scanned, proven, allowlist, audit chain, deferred, replayable capsule.
 Never say: "AI agent hacks your API", "production-ready", "finds bugs in any API",
 "validated on real platforms", "30 findings", or any number you did not see print.
+Two traps from `deck/DECK_AUDIT.md`: "negative control on every test" (it is 4 of 7 —
+route-driven only; logic findings close a ledger invariant instead) and "the agent decides
+what to test" (the planner picks from an enum; a rule engine decides).
 One sentence of scope honesty ("everything here runs against the bundled target, no
 external host is touched") buys more credibility than any adjective.
 
