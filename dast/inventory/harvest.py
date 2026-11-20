@@ -48,7 +48,13 @@ class HarvestResult:
         return {"source": self.source, "sha256": self.sha256, "routes": sorted(self.routes)}
 
 
-def normalise_js_route(raw: str) -> str | None:
+#: Where an API lives, by convention.  A target under a different prefix (``/v2/``,
+#: ``/rest/``, ``/graphql/``) supplies its own through the profile; the bundled mock
+#: keeps the version-1 default so nothing about it changes.
+DEFAULT_PREFIXES: tuple[str, ...] = ("/api/",)
+
+
+def normalise_js_route(raw: str, prefixes: tuple[str, ...] = DEFAULT_PREFIXES) -> str | None:
     """Turn a JS route string into a path template, or None if unusable."""
     if not raw or "://" in raw:
         return None
@@ -56,7 +62,7 @@ def normalise_js_route(raw: str) -> str | None:
     path = _PLACEHOLDER.sub("{id}", path)
     if not path.startswith("/"):
         path = "/" + path
-    if not path.startswith("/api/"):
+    if not any(path.startswith(prefix) for prefix in prefixes):
         return None
     if path.count("{id}") > 4:
         return None
@@ -67,21 +73,21 @@ def normalise_js_route(raw: str) -> str | None:
     return "/" + "/".join(segments)
 
 
-def harvest_text(text: str) -> set[str]:
+def harvest_text(text: str, prefixes: tuple[str, ...] = DEFAULT_PREFIXES) -> set[str]:
     text = strip_comments(text or "")
     found: set[str] = set()
     for m in _QUOTED.finditer(text):
-        r = normalise_js_route(m.group("path"))
+        r = normalise_js_route(m.group("path"), prefixes)
         if r:
             found.add(r)
     for m in _PLAIN.finditer(text):
-        r = normalise_js_route(m.group(0))
+        r = normalise_js_route(m.group(0), prefixes)
         if r:
             found.add(r)
     return found
 
 
-def harvest_file(path: str | Path) -> HarvestResult:
+def harvest_file(path: str | Path, prefixes: tuple[str, ...] = DEFAULT_PREFIXES) -> HarvestResult:
     p = Path(path)
     blob = p.read_bytes()
     try:
@@ -91,12 +97,14 @@ def harvest_file(path: str | Path) -> HarvestResult:
     return HarvestResult(
         source=str(p),
         sha256=hashlib.sha256(blob).hexdigest(),
-        routes=sorted(harvest_text(text)),
+        routes=sorted(harvest_text(text, prefixes)),
     )
 
 
-def harvest_files(paths: Iterable[str | Path]) -> list[HarvestResult]:
-    return [harvest_file(p) for p in paths]
+def harvest_files(
+    paths: Iterable[str | Path], prefixes: tuple[str, ...] = DEFAULT_PREFIXES
+) -> list[HarvestResult]:
+    return [harvest_file(p, prefixes) for p in paths]
 
 
 def union_routes(results: Iterable[HarvestResult]) -> set[str]:

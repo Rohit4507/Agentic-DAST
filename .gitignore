@@ -1,5 +1,7 @@
 # Scan output (regenerated on every run)
 work/
+work2/
+work-*/
 Logs/
 findings_report.md
 findings.json

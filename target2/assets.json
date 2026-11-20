@@ -1,0 +1,10 @@
+{
+  "_comment": "Asset ownership for the second target. Longest matching path prefix wins.",
+  "owners": {
+    "/v2/orders/": "Orders & Settlements team",
+    "/v2/orders": "Orders & Settlements team",
+    "/v2/legacy": "Agent Console (retired)",
+    "/v2/internal/reports": "Revenue Reporting",
+    "/v2/health": "Platform Engineering"
+  }
+}

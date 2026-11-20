@@ -264,7 +264,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     state_file = eng.out / "bundle_state.json"
     state = load_bundle_state(state_file)
     bundles = list(args.bundle) if args.bundle else list(eng.cfg.js_bundles)
-    results = harvest_files([b for b in bundles if Path(b).exists()])
+    results = harvest_files([b for b in bundles if Path(b).exists()], eng.profile.bundle.route_prefixes)
     if not results:
         print("no bundles found; pass --bundle path/to/app.js", file=sys.stderr)
         return 2

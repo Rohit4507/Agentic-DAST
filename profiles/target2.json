@@ -1,0 +1,98 @@
+{
+  "name": "target2-orders-api",
+  "description": "A structurally different API: /v2 prefixes, everything nested under data, tenant instead of agencyId, value/state instead of amount/status, settlements/reversals instead of payments/refunds. Same vulnerability classes, different vocabulary.",
+  "flows": {
+    "hold": {
+      "path": "/v2/orders",
+      "body": {
+        "pax": "{pax}",
+        "amount": "{amount}"
+      },
+      "id_from": "data.order.id"
+    },
+    "pay": {
+      "path": "/v2/orders/{id}/settle",
+      "body": {
+        "value": "{amount}"
+      }
+    },
+    "confirm": {
+      "path": "/v2/orders/{id}/confirm",
+      "body": {}
+    },
+    "cancel": {
+      "path": "/v2/orders/{id}/cancel",
+      "body": {}
+    },
+    "refund": {
+      "path": "/v2/orders/{id}/refund",
+      "body": {
+        "value": "{amount}"
+      }
+    },
+    "rebook": {
+      "path": "/v2/orders/{id}/reprice",
+      "body": {
+        "total": "{tampered}"
+      }
+    },
+    "ledger": {
+      "path": "/v2/orders/{id}/statement",
+      "method": "GET"
+    }
+  },
+  "identifiers": {
+    "identity_field": "data.order.id",
+    "boundary_field": "data.order.tenant",
+    "identity_candidates": [
+      "data.order.id",
+      "data.order.order_id",
+      "data.id",
+      "id",
+      "order_id"
+    ],
+    "boundary_candidates": [
+      "data.order.tenant",
+      "data.tenant",
+      "tenant"
+    ],
+    "object_noun": "order"
+  },
+  "agency": {
+    "probe_paths": [
+      "/v2/orders"
+    ],
+    "fields": [
+      "data.tenant",
+      "tenant",
+      "data.agency.id"
+    ]
+  },
+  "ledger": {
+    "adapter": "http",
+    "endpoint": "/v2/orders/{id}/statement",
+    "map": {
+      "status": "data.status",
+      "quotedAmount": "data.quote_total",
+      "finalAmount": "data.final_total",
+      "paxCount": "data.pax",
+      "payments": "data.settlements",
+      "refunds": "data.reversals"
+    },
+    "item_map": {
+      "amount": "value",
+      "status": "state"
+    }
+  },
+  "bola": {
+    "exclude_templates": [
+      "/legacy/",
+      "/internal/"
+    ]
+  },
+  "bundle": {
+    "route_prefixes": [
+      "/v2/"
+    ]
+  }
+}

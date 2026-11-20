@@ -59,6 +59,7 @@ _KNOWN_KEYS = {
     "assets_file",
     "allow_insecure_tls",
     "user_agent",
+    "profile",
 }
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
@@ -89,6 +90,9 @@ class ScopeConfig:
     js_bundles: tuple[str, ...] = ()
     assets_file: str = ""
     allow_insecure_tls: bool = False
+    #: Path to the target profile (vocabulary: paths, bodies, field names).
+    #: Empty means "the bundled mock's vocabulary", i.e. version-1 behaviour.
+    profile: str = ""
     user_agent: str = "dast-agent/0.1 (scope-checked; security testing)"
 
     # -- construction ---------------------------------------------------------------
@@ -163,6 +167,7 @@ class ScopeConfig:
             js_bundles=tuple(str(b) for b in raw.get("js_bundles", ())),
             assets_file=str(raw.get("assets_file", "")),
             allow_insecure_tls=bool(raw.get("allow_insecure_tls", False)),
+            profile=str(raw.get("profile", "") or ""),
             user_agent=str(raw.get("user_agent", "dast-agent/0.1 (scope-checked; security testing)")),
         )
 

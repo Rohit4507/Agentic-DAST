@@ -1,0 +1,28 @@
+{
+  "name": "target2-orders-api",
+  "description": "Second target: same vulnerability classes, different vocabulary. The profile does the translating; not one line of attack code differs from the mock run.",
+  "base_url": "http://127.0.0.1:8081",
+  "profile": "profiles/target2.json",
+  "allow_hosts": ["127.0.0.1"],
+  "allow_methods": ["GET", "POST"],
+  "allow_paths": [
+    "/v2/health",
+    "/v2/orders",
+    "/v2/legacy/orders",
+    "/v2/internal/reports"
+  ],
+  "deny_paths": ["/v2/admin"],
+  "max_rps_per_host": 8,
+  "max_burst": 8,
+  "max_total_requests": 120,
+  "max_wait_seconds": 10,
+  "accounts": {
+    "tenant_a": "literal:tok-tenant-a",
+    "tenant_b": "literal:tok-tenant-b"
+  },
+  "kill_switch_file": "KILL",
+  "traffic_window_days": 30,
+  "js_bundles": ["target2/static/app.js"],
+  "assets_file": "target2/assets.json",
+  "allow_insecure_tls": false
+}
